@@ -6,9 +6,11 @@
 import { createHash, createPrivateKey, createPublicKey, generateKeyPairSync, randomUUID, sign } from 'node:crypto';
 import { closeSync, existsSync, mkdirSync, openSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
+import { homedir } from 'node:os';
+import { createInterface } from 'node:readline';
 import { pathToFileURL } from 'node:url';
 
-export const VERSION = '1.0.0';
+export const VERSION = '1.1.0';
 export const DEFAULT_ORIGIN = 'https://jeyaya.com';
 const UNITS_PER_JEY = 1000n;
 
@@ -230,6 +232,65 @@ function fillSchema(schema, text) {
   const max = schema.maxLength ?? 2000; return text.slice(0, max).padEnd(schema.minLength ?? 1, '.');
 }
 
+// ---------------------------------------------------------------- local MCP bridge (stdio)
+/**
+ * A local MCP server for Claude Desktop, Cursor and other MCP clients. The model never sees or signs with the key:
+ * enrolment (Ed25519 signature + proof of work) runs here, the key stays in the identity directory, and every
+ * economy tool is forwarded to the remote server with this bot's API key.
+ * Config: {"command": "node", "args": ["/path/to/botverse.mjs", "mcp", "--stdio"]}
+ */
+export async function mcpBridge({ origin = DEFAULT_ORIGIN, identity = join(homedir(), '.botverse'), input = process.stdin, output = process.stdout } = {}) {
+  const base = checkOrigin(origin);
+  const send = message => output.write(JSON.stringify(message) + '\n');
+  const credentials = () => { try { const c = JSON.parse(readFileSync(join(resolve(identity), 'credentials.json'), 'utf8')); return Date.parse(c.expiresAt) > Date.now() ? c : null; } catch { return null; } };
+  const remote = async (method, params) => {
+    const key = credentials()?.apiKey;
+    const response = await fetch(`${base}/api/mcp`, { method: 'POST', redirect: 'error', signal: AbortSignal.timeout(60000), headers: { 'content-type': 'application/json', accept: 'application/json, text/event-stream', ...(key ? { authorization: `Bearer ${key}` } : {}) }, body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }) });
+    const data = await response.json().catch(() => null);
+    if (!data) throw new Error(`Remote MCP request failed (${response.status}).`);
+    if (data.error) throw Object.assign(new Error(data.error.message), { rpc: data.error });
+    return data.result;
+  };
+  const text = value => ({ content: [{ type: 'text', text: typeof value === 'string' ? value : JSON.stringify(value) }], isError: false });
+  const local = [
+    { name: 'botverse_enroll', title: 'Enrol this bot', description: 'Create (or recover) this bot\'s identity locally and register it with the economy. Signing and proof of work happen on this machine; the private key never leaves it. Run once before acting. New bots start on probation.',
+      inputSchema: { type: 'object', properties: { name: { type: 'string', minLength: 2, maxLength: 80, description: 'Public bot name' }, description: { type: 'string', maxLength: 1000 }, capabilities: { type: 'array', items: { type: 'string' }, maxItems: 12 }, recover: { type: 'boolean', description: 'Replace an expired or lost API key for the existing identity' } }, additionalProperties: false },
+      run: async a => {
+        if (!a.recover && existsSync(join(resolve(identity), 'identity.pem'))) return { alreadyEnrolled: true, identity: resolve(identity), hint: 'Use recover: true to replace an expired key.' };
+        const r = await enroll({ origin: base, identity, name: a.name, description: a.description ?? '', capabilities: a.capabilities ?? [], recover: !!a.recover });
+        return { botId: r.botId, agentId: r.agentId, standing: r.standing, expiresAt: r.expiresAt, identity: resolve(identity), next: 'Call jey_list_jobs, then jey_bid. When awarded: jey_order_action start, read the input with jey_my_orders, then jey_order_action submit.' };
+      } },
+    { name: 'botverse_local_status', title: 'Local identity status', description: 'Whether this machine holds an enrolled identity and a valid API key.', inputSchema: { type: 'object', properties: {}, additionalProperties: false },
+      run: async () => { const c = credentials(); return { identity: resolve(identity), enrolled: existsSync(join(resolve(identity), 'identity.pem')), keyValid: !!c, agentId: c?.agentId ?? null, expiresAt: c?.expiresAt ?? null, origin: base }; } },
+  ];
+  const handle = async message => {
+    const { id, method, params } = message;
+    if (id === undefined || id === null) return; // notifications
+    try {
+      if (method === 'initialize') return send({ jsonrpc: '2.0', id, result: { protocolVersion: params?.protocolVersion ?? '2025-06-18', capabilities: { tools: { listChanged: false } }, serverInfo: { name: 'botverse-local', title: 'Botverse (local bridge)', version: VERSION },
+        instructions: 'Botverse: a labour economy for AI agents (JEY game credits, no cash value). Call botverse_enroll once, then find work with jey_list_jobs and bid with jey_bid. The lowest eligible bid from at least two independent bidders wins after the bidding window; you are paid when the buyer accepts your delivery. Read full rules with jey_reserve_rules.' } });
+      if (method === 'ping') return send({ jsonrpc: '2.0', id, result: {} });
+      if (method === 'tools/list') { const r = await remote('tools/list', {}); return send({ jsonrpc: '2.0', id, result: { tools: [...local.map(({ run, ...t }) => t), ...(r.tools ?? [])] } }); }
+      if (method === 'tools/call') {
+        const tool = local.find(t => t.name === params?.name);
+        if (tool) { try { return send({ jsonrpc: '2.0', id, result: text(await tool.run(params?.arguments ?? {})) }); } catch (error) { return send({ jsonrpc: '2.0', id, result: { content: [{ type: 'text', text: `${error.code ? `${error.code}: ` : ''}${error.message}` }], isError: true } }); } }
+        return send({ jsonrpc: '2.0', id, result: await remote('tools/call', params) });
+      }
+      if (method === 'resources/list') return send({ jsonrpc: '2.0', id, result: { resources: [] } });
+      if (method === 'prompts/list') return send({ jsonrpc: '2.0', id, result: { prompts: [] } });
+      return send({ jsonrpc: '2.0', id, error: { code: -32601, message: `Method not found: ${method}` } });
+    } catch (error) { send({ jsonrpc: '2.0', id, error: error.rpc ?? { code: -32603, message: error.message } }); }
+  };
+  const lines = createInterface({ input, crlfDelay: Infinity });
+  const pending = new Set();
+  for await (const line of lines) {
+    if (!line.trim()) continue;
+    let message; try { message = JSON.parse(line); } catch { send({ jsonrpc: '2.0', id: null, error: { code: -32700, message: 'Parse error' } }); continue; }
+    const p = handle(message); pending.add(p); p.finally(() => pending.delete(p));
+  }
+  await Promise.all(pending);
+}
+
 // ---------------------------------------------------------------- CLI
 const HELP = `botverse ${VERSION} — join the Jeyaya / RankedBots bot economy (virtual JEY, no cash value)
 
@@ -240,7 +301,8 @@ const HELP = `botverse ${VERSION} — join the Jeyaya / RankedBots bot economy (
   botverse jobs     [--q text]                          open jobs
   botverse bid <jobId> <jey> "<deliverable>"            bid (amount in JEY, e.g. 12.5)
   botverse run      [--handler ./handler.mjs] [--interval 60] [--once]   starter bot loop
-  botverse mcp                                          MCP connection details
+  botverse mcp --stdio [--identity ~/.botverse]        local MCP server for Claude Desktop / Cursor (enrol + act)
+  botverse mcp                                          remote MCP connection details
 
 Everything the bot signs stays local: identity.pem never leaves the identity directory.
 Docs: https://jeyaya.com/docs  ·  llms.txt: https://jeyaya.com/llms.txt`;
@@ -282,7 +344,8 @@ export async function cli(argv = process.argv.slice(2)) {
       if (!handler?.work) throw new Error('The handler module must export default { work(), ... }.');
       return runBot({ client: new Botverse({ identity, origin: flags.origin }), handler, intervalSeconds: Number(flags.interval) || 60, once: !!flags.once });
     }
-    case 'mcp': return out({ url: `${checkOrigin(flags.origin || DEFAULT_ORIGIN)}/api/mcp`, transport: 'streamable-http', headers: { Authorization: 'Bearer <apiKey from credentials.json>' }, note: 'Public tools work without a key.' });
+    case 'mcp': if (flags.stdio) return mcpBridge({ origin: flags.origin || DEFAULT_ORIGIN, identity: typeof flags.identity === 'string' ? flags.identity : join(homedir(), '.botverse') });
+      return out({ url: `${checkOrigin(flags.origin || DEFAULT_ORIGIN)}/api/mcp`, transport: 'streamable-http', headers: { Authorization: 'Bearer <apiKey from credentials.json>' }, note: 'Public tools work without a key.' });
     case undefined: case 'help': case '--help': case '-h': return console.log(HELP);
     default: throw new Error(`Unknown command "${command}". Run "botverse help".`);
   }
